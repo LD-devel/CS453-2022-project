@@ -10,18 +10,19 @@ SOURCE_DIRS  := .
 
 WILD_EXT  = $(strip $(foreach EXT,$($(1)),$(wildcard $(2)/*.$(EXT))))
 
-HDRS_C   := $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),$(call WILD_EXT,EXT_H,$(INCLUDE_DIR)))
+HDRS_C   := $(foreach INCLUDE_DIR,$(INCLUDED_IRS),$(call WILD_EXT,EXT_H,$(INCLUDE_DIR)))
 HDRS_CXX := $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),$(call WILD_EXT,EXT_HPP,$(INCLUDE_DIR)))
 SRCS_C   := $(foreach SOURCE_DIR,$(SOURCE_DIRS),$(call WILD_EXT,EXT_C,$(SOURCE_DIR)))
 SRCS_CXX := $(foreach SOURCE_DIR,$(SOURCE_DIRS),$(call WILD_EXT,EXT_CXX,$(SOURCE_DIR)))
 OBJS     := $(SRCS_C:%=%.o) $(SRCS_CXX:%=%.o)
 
+DBFLAGS  := -g
 CC       := $(CC)
-CCFLAGS  := -Wall -Wextra -Wfatal-errors -O2 -std=c11 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR))
+CCFLAGS  := $(DBFLAGS) -Wall -Wextra -Wfatal-errors -O2 -std=c11 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR))
 CXX      := $(CXX)
-CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++17 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR))
+CXXFLAGS := $(DBFLAGS) -Wall -Wextra -Wfatal-errors -O2 -std=c++17 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR))
 LD       := $(if $(SRCS_CXX),$(CXX),$(CC))
-LDFLAGS  :=
+LDFLAGS  := $(DBFLAGS)
 LDLIBS   := -ldl -lpthread
 
 LIB_DIRS := $(filter-out ../include/ ../grading/ ../playground/ ../template/ ../sync-examples/,$(filter-out $(wildcard ../*),$(wildcard ../*/)))

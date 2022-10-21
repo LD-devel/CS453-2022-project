@@ -16,7 +16,7 @@ SRCS_C   := $(call WILD_EXT,EXT_C,$(SOURCE_DIR))
 SRCS_CXX := $(call WILD_EXT,EXT_CXX,$(SOURCE_DIR))
 OBJS     := $(SRCS_C:%=%.o) $(SRCS_CXX:%=%.o)
 
-DBFLAGS  := 
+DBFLAGS  := -g
 CC       := $(CC)
 CCFLAGS  := $(DBFLAGS) -Wall -Wextra -Wfatal-errors -O2 -std=c11 -fPIC -I$(INCLUDE_DIR)
 CXX      := $(CXX)

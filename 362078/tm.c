@@ -23,6 +23,7 @@
 // External headers
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 // Internal headers
 #include <tm.h>
@@ -59,8 +60,8 @@ typedef struct region
     struct lock_t segments_lock; 
     uint16_t ctr;
     void* segment_addresses[2^16];
-    void* segment_locks[2^16];
-    // TODO: add queue
+    atomic_uint segment_locks[2^16];
+    // TODO: add queue and index freeing mechanism
 
     // TODO: we need some data-structure to store read write sets
     // of transactions
@@ -77,8 +78,31 @@ uint16_t get_seg_index(shared_t shared){
     mem_region* region = (mem_region *)shared;
     lock_acquire(&(region->segments_lock));
     uint16_t tmp_ctr = region->ctr++;
+    // TODO: double check, if this is the correct fence
+    atomic_thread_fence(memory_order_acquire);
     lock_release(&(region->segments_lock));
     return tmp_ctr;
+}
+
+/**
+ * Memcpy but bite-wise atomic.
+ * This allows for undefined content when called concurrently,
+ * but no undefined behaviour.
+*/
+void byte_wise_atomic_memcpy(void const* dest, void const* source, size_t count, memory_order order){
+    for (size_t i = 0; i < count; ++i) {
+        ((char*)(dest))[i] =
+            atomic_load_explicit(((char*)(source))+i, order);
+    }
+    atomic_thread_fence(order);
+}
+
+/**
+* Clean up after aborted transaction
+*/
+void tx_abort(shared_t unused(shared), tx_t unused(tx)){
+    //TODO;
+    // Free all memory segments that have not been commited yet.
 }
 
 /**
@@ -113,6 +137,7 @@ shared_t tm_create(size_t size, size_t align) {
         free(region);
         return invalid_shared;
     }
+    region->segment_locks[0] = 0;
 
     // Init the global version clock for this shared memory region
     // and the lock for the list of segments
@@ -120,6 +145,7 @@ shared_t tm_create(size_t size, size_t align) {
         !lock_init(&(region->segments_lock))) {
         free(region->start);
         free(region);
+        return invalid_shared;
     }
 
     // 0 over the start memory segment
@@ -144,22 +170,26 @@ void tm_destroy(shared_t shared) {
     mem_region* region = (mem_region*) shared;
 
     // TODO: free anything that region points to
-    // TODO: free segments
 
+    // free segments
+    for (size_t i = 0; i < region->ctr; i++){
+        // TODO: skip segments that have been freed already
+        free(region->segment_addresses[i]);
+    }
+    
     free(region->segment_addresses[0]); // free the non-free-able 
     gvc_clean_up(&(region->regional_gvc));
     lock_cleanup(&(region->segments_lock));
-    // We want to free region last, to be able to free all
-    // memory it points to
-    free(region);
+    free(region); // free region last
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
  * @param shared Shared memory region to query
  * @return Start address of the first allocated segment
 **/
-void* tm_start(shared_t shared) {
-    return ((mem_region*) shared)->segment_addresses[0];
+void* tm_start(shared_t unused(shared)) {
+    // TODO: this is a bit sketchy with the null-pointer and what not
+    return (void *)0;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -178,9 +208,28 @@ size_t tm_align(shared_t shared) {
     return ((mem_region*) shared)->align;
 }
 
-typedef struct transaction {
+typedef struct transaction_context {
     bool is_ro;
 } tx_con; 
+
+/**
+ * @brief Translate a virtual memory address to an address
+ * specific to the regions memory layout
+ * TODO: do we ever need this?
+*/ 
+
+/**
+ * @brief Resolve a regional virtual address to a plain virtual 
+ * address
+ * @param shared Pointer to region providing the memory context
+ * @param ptr Regional virtual address
+ * @return A valid virtual address
+*/
+void* resolve_addr(shared_t shared, void const* ptr) {
+    //offset: 0x0FFF && ptr;
+    //index: 48 >> ptr
+    return (void*)((uint64_t)((mem_region *) shared)->segment_addresses[(uint16_t) ((uint64_t) ptr >> 48)] + (uint64_t)(0x0FFF && ptr));
+}
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
  * @param shared Shared memory region to start a transaction on
@@ -210,14 +259,15 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
 **/
-bool tm_end(shared_t unused(shared), tx_t tx) {
+bool tm_end(shared_t shared, tx_t tx) {
     // TODO: tm_end(shared_t, tx_t)
 
-    // if read-only
-    //      lock the required memory segments from the read set
-    //      perform all read operations
-    //      unlock the required memory segments
-    // TODO: if we keep track on whether there is another transaction wanting to write on our read-only memory, we can skip the locks if there are none
+    tx_con* transaction = (tx_con *)tx;
+    if (transaction->is_ro){
+        return true;
+    }
+
+    //mem_region* region = (mem_region *)shared;
 
     // commit all read/alloc/write/free operations
     // only free memory segments from this transaction,
@@ -226,6 +276,7 @@ bool tm_end(shared_t unused(shared), tx_t tx) {
     // free the transaction context from memory
     free((tx_con*)tx);
 
+    tx_abort(shared, tx);
     return false;
 }
 
@@ -237,14 +288,38 @@ bool tm_end(shared_t unused(shared), tx_t tx) {
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* unused(source), size_t unused(size), void* unused(target)) {
-    // TODO: tm_read(shaared_t, tx_t, void const*, size_t, void*)
+bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
+    // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
+    mem_region* region = (mem_region *)shared;
+    tx_con* transaction = (tx_con *)tx;
 
-    // if read-only 
-    //      simply aggregate all read operations
+    if (transaction->is_ro){
+        // sample GVC
+        unsigned int rv;
+        gvc_read(&(region->regional_gvc), &rv);
+        // read
+        byte_wise_atomic_memcpy(resolve_addr(shared, target),
+            resolve_addr(shared, source), 
+            size, memory_order_acquire);
+        // post-validation
+        //   check that the lock is free
+        //   and that the version of the lock is <= rv
+        uint16_t segment_idx = (uint16_t)((uint64_t) source >> 48);
+        uint v_lock_val = atomic_load(&region->segment_locks[segment_idx]);
+        if ((v_lock_val & 1) || ((v_lock_val >> 1) > rv)){
+            // post-validation failed
+            tx_abort(shared, tx);
+            return false;
+        }
+        return true;
+    }
 
-    // if not read-oly first check, if this is a segment allocated in  the current transaction
+    // if not read-only first check, if this is a segment allocated in  the current transaction
 
+    // if yes: everything with no worries
+    // else: TODO
+
+    tx_abort(shared, tx);
     return false;
 }
 
@@ -271,9 +346,6 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* unused(sourc
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
 alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), void** unused(target)) {
-    // TODO: use the transaction handle tx and the shared memory handle shared_t to avoid concurrent memory allocation
-
-    /*
     // Allocate segment
     // 1. get the alignment from the pointer to the region
     size_t align = ((mem_region*) shared)->align;
@@ -281,28 +353,17 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
 
     // sn is a pointer to a segment_node
     // we cast that into a pointer to a memory word (void**)
-    struct segment_node* sn;
-    if (unlikely(posix_memalign((void**)&sn, align, sizeof(struct segment_node) + size) != 0)) return nomem_alloc; // Failed allocation!
+    void* segment;
+    if (unlikely(posix_memalign(&segment, align, size) != 0)) return nomem_alloc; // Failed allocation!
 
-    // Make this segment the last one in the linked list
-    sn->prev = NULL;
-    sn->next = ((mem_region*) shared)->segments;
-    if (sn->next) sn->next->prev = sn;
-    // Also let the linked list now that it has a new last element
-    // TODO: WARNING: Why would this work if two threads concurrently allocate memory?
-    // We get a concurrent write to the linked list
-    // I don't think this should work
-    ((mem_region*) shared)->segments = sn;
+    // store our address in the huge array of all addresses
+    uint16_t segment_index = get_seg_index(shared);
+    ((struct region*)shared)->segment_addresses[segment_index] = segment;
 
-    // We cast sn into an uintptr_t because pointer arithmetic on void* pointers is illegal
-    void* segment = (void*) ((uintptr_t) sn + sizeof(struct segment_node));
-    // 0 everything
+    // 0 everything and set target
     memset(segment, 0, size);
-    // now that everything is done, we can set the value of the target pointer
     *target = segment;
-    return success_alloc;*/
-
-    return nomem_alloc;
+    return success_alloc;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
@@ -312,12 +373,8 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
-    // TODO: use the transaction id tx and the shared memory handle shared_t to avoid concurrent memory allocation
-
-    /*struct segment_node* sn = (struct segment_node*) ((uintptr_t) target - sizeof(struct segment_node));
-
-    if (sn->prev) sn->prev->next = sn->next;
-    else ((struct region*) shared)->segments*/
+    // TODO: add this to a list of segments that will be freed upon commit
+    // if this is in the set of just uncommited allocations, we can free directly
 
     return false;
 }

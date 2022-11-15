@@ -33,15 +33,94 @@
 #include "shared-lock.h"
 
 /**
- * @brief Single linked list of dynamically allocated shared memory segments.
-
-struct segment_node {
-    struct segment_node* prev;
-    struct segment_node* next;
-    // TODO: amend by pointer or pointer to memory word here
-    unsigned int versioned_mem_lock;
+ * @brief Single linked list of writes
+ */
+struct write_node {
+    struct write_node* prev;
+    struct write_node* next;
+    void* source;
+    size_t size;
+    void* target;
 };
-typedef struct segment_node* segment_list; */
+typedef struct write_node* write_list;
+
+/**
+ * @brief Single linked list of reads
+ */
+struct read_node {
+    struct read_node* prev;
+    struct read_node* next;
+    uint16_t segment_idx;
+};
+typedef struct read_node* read_list;
+
+typedef struct transaction_context {
+    bool is_ro;
+    unsigned int rv;
+    read_list reads;
+    write_list writes;
+} tx_con;
+
+// Reads simply get inserted at the start of the list
+void insert_read(read_list* reads_ptr, uint16_t segment_idx){
+    struct read_node* n_read = (struct read_node*) malloc(sizeof(struct read_node));
+    n_read->next = *reads_ptr;
+    n_read->prev = NULL;
+    n_read->segment_idx = segment_idx;
+    *reads_ptr = n_read;
+}
+
+// Write get inserted in a sorted manner and intervals get updated accordingly
+void insert_write(write_list* writes_ptr, void* source,size_t size, void* target){
+    struct write_node* n_write = (struct write_node*) malloc(sizeof(struct write_node));
+    n_write->source = source;
+    n_write->size = size;
+    n_write->target = target;
+
+    if(!(*writes_ptr)){
+        (*writes_ptr) = n_write;
+        return;
+    }
+
+    // find the correct slot to insert
+    // we ensure that prev<new and next>=new
+    struct write_node* prev = NULL;
+    struct write_node* next = *writes_ptr;
+    while (next && next->target < target){
+        prev = next;
+        next = next->next;
+    }
+    if(prev) prev->next = n_write;
+    n_write->prev = prev;
+    n_write->next = next;
+    if(next) next->prev = n_write;
+
+    // update bounds of prev
+    if(prev){
+        unsigned char* prev_end = (unsigned char *)prev->target + (prev->size -1);
+        unsigned char* new_start = (unsigned char *)n_write->target;
+        if(prev_end >= new_start){
+            prev->size = prev->size - (prev_end - new_start +1);
+        }
+    }
+    // remove next if necessary
+    unsigned char* new_end = (unsigned char *)n_write->target + (n_write->size -1);
+    while(next && ((unsigned char *)next->target + (next->size -1)) <= new_end){
+        n_write->next = next->next;
+        free(next);
+        next = n_write->next;
+    }
+    // update next's target address and size if necessary
+    if(next){
+        unsigned char * next_start = (unsigned char *)next->target;
+        if(next_start <= new_end){
+            size_t delta = (new_end - next_start) + 1;
+            next->target = (void*)(new_end + 1);
+            next->size = next->size - delta;
+            next->source = (void*)((unsigned char *)next->source + delta);
+        }
+    }
+}
 
 /**
  * @brief Struct for the context of all transactions in one shared memory region
@@ -74,7 +153,6 @@ typedef struct region
  * @return Next free index in the array of memory segments
 */
 uint16_t get_seg_index(shared_t shared){
-    // TODO: throw exception if ctr > 2^16
     mem_region* region = (mem_region *)shared;
     lock_acquire(&(region->segments_lock));
     uint16_t tmp_ctr = region->ctr++;
@@ -98,11 +176,34 @@ void byte_wise_atomic_memcpy(void const* dest, void const* source, size_t count,
 }
 
 /**
-* Clean up after aborted transaction
+* Clean up after transaction
 */
-void tx_abort(shared_t unused(shared), tx_t unused(tx)){
-    //TODO;
-    // Free all memory segments that have not been commited yet.
+void tx_clear(shared_t unused(shared), tx_t tx){
+
+    tx_con* transaction = (tx_con*)tx;
+    // TODO: Free all memory segments that have not been commited yet
+    // and hand back their index
+
+    if (!transaction->is_ro){
+        // Free the read and write set
+        if (transaction->reads){
+            struct read_node* curr = transaction->reads;
+            while (curr->next){
+                struct read_node* old = curr;
+                struct read_node* curr = curr->next;
+                free(old);
+            }
+        }        
+        if (transaction->writes){
+            struct write_node* curr = transaction->writes;
+            while (curr->next){
+                struct write_node* old = curr;
+                struct write_node* curr = curr->next;
+                free(old);
+            }
+        }
+    }
+    free(transaction);
 }
 
 /**
@@ -208,10 +309,6 @@ size_t tm_align(shared_t shared) {
     return ((mem_region*) shared)->align;
 }
 
-typedef struct transaction_context {
-    bool is_ro;
-} tx_con; 
-
 /**
  * @brief Translate a virtual memory address to an address
  * specific to the regions memory layout
@@ -236,7 +333,7 @@ void* resolve_addr(shared_t shared, void const* ptr) {
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
-tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
+tx_t tm_begin(shared_t shared, bool is_ro) {
 
     // TODO: Do we have to register the transaction with the region
     // for some reason? I don't see yet why we would.
@@ -246,11 +343,11 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
     if( unlikely(!tx_new)){
         return invalid_tx;
     }
-
-    // if (!is_ro)
-    //  set up stuff for a speculative execution
-    //  store info whether transaction is_ro
-
+    mem_region* region = (mem_region *)shared;
+    gvc_read(&(region->regional_gvc), &tx_new->rv); // sample GVC
+    tx_new->is_ro = is_ro;                          // store is_ro
+    tx_new->reads = NULL;
+    tx_new->writes = NULL;
     return (tx_t) tx_new;
 }
 
@@ -272,11 +369,8 @@ bool tm_end(shared_t shared, tx_t tx) {
     // commit all read/alloc/write/free operations
     // only free memory segments from this transaction,
     // if they should not remain in the shared memory region
-    
-    // free the transaction context from memory
-    free((tx_con*)tx);
 
-    tx_abort(shared, tx);
+    tx_clear(shared, tx);
     return false;
 }
 
@@ -292,35 +386,47 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
     mem_region* region = (mem_region *)shared;
     tx_con* transaction = (tx_con *)tx;
+    uint16_t segment_idx = (uint16_t)((uint64_t) source >> 48);
+    uint v_lock_val;
 
-    if (transaction->is_ro){
-        // sample GVC
-        unsigned int rv;
-        gvc_read(&(region->regional_gvc), &rv);
-        // read
+    if (likely(transaction->is_ro)){
+        // read directly
         byte_wise_atomic_memcpy(resolve_addr(shared, target),
             resolve_addr(shared, source), 
             size, memory_order_acquire);
-        // post-validation
-        //   check that the lock is free
-        //   and that the version of the lock is <= rv
-        uint16_t segment_idx = (uint16_t)((uint64_t) source >> 48);
-        uint v_lock_val = atomic_load(&region->segment_locks[segment_idx]);
-        if ((v_lock_val & 1) || ((v_lock_val >> 1) > rv)){
-            // post-validation failed
-            tx_abort(shared, tx);
+        v_lock_val = atomic_load(&region->segment_locks[segment_idx]);
+    } else {
+        insert_read(&(transaction->reads),segment_idx);
+
+        uint old_lock_v = atomic_load(&region->segment_locks[segment_idx]); // prior lock load
+
+        // check if read overlaps with write set
+        // perform the corresponding read operations
+        while(size != 0){
+            
+            // TODO
+        }
+
+        tx_clear(shared, tx);
+        return false;
+        
+        v_lock_val = atomic_load(&region->segment_locks[segment_idx]); // posterior lock load
+        if(old_lock_v != v_lock_val){
+            tx_clear(shared, tx);
             return false;
         }
-        return true;
     }
+    // post-validation
+    //   check that the lock is free
+    //   and that the version of the lock is <= rv
+    if ((v_lock_val & 1) || ((v_lock_val >> 1) > transaction->rv)){
+        // post-validation failed
+        tx_clear(shared, tx);
+        return false;
+    }
+    return true;
 
-    // if not read-only first check, if this is a segment allocated in  the current transaction
-
-    // if yes: everything with no worries
-    // else: TODO
-
-    tx_abort(shared, tx);
-    return false;
+    // TODO: add optimization for rw by checking if is a segment allocated in the current transaction
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.

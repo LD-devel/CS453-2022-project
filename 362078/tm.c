@@ -391,7 +391,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 
     if (likely(transaction->is_ro)){
         // read directly
-        byte_wise_atomic_memcpy(resolve_addr(shared, target),
+        byte_wise_atomic_memcpy(target,
             resolve_addr(shared, source), 
             size, memory_order_acquire);
         v_lock_val = atomic_load(&region->segment_locks[segment_idx]);
@@ -402,13 +402,50 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 
         // check if read overlaps with write set
         // perform the corresponding read operations
+        // calc start&end address
+        unsigned char* start_adr = (unsigned char *)source;
+        unsigned char* end_adr = (unsigned char *)source + (size -1);
+        unsigned char* private_start_adr = (unsigned char *)target;
         while(size != 0){
-            
-            // TODO
-        }
+            // loop through writes until we find a writes ending after our start address
+            struct write_node* curr = transaction->writes;
+            while (curr && (unsigned char *)curr->target + (curr->size -1) < start_adr){
+                curr = curr->next;
+            }
+            // make sure that the write is not beyond our read
+            if (curr && (unsigned char *)curr->target <= end_adr){
+                unsigned char* ovr_start_adr = (unsigned char *)curr->target;
+                unsigned char* ovr_end_adr = ovr_start_adr + curr->size;
+                // copy from shared region if the overlap starts after our source
+                if ( start_adr < ovr_start_adr){
+                    size_t delta = ovr_start_adr - start_adr; // TODO:double check
+                    byte_wise_atomic_memcpy((void *)private_start_adr,
+                        resolve_addr(shared, (void *)start_adr), 
+                        delta, memory_order_acquire);
+                    start_adr += delta;
+                    private_start_adr += delta;
+                    size -= delta;
+                }
+                // now overwritten_start <= start_adr
+                size_t ovr_offset = ovr_start_adr < start_adr ? start_adr - ovr_start_adr : 0;
+                // copy from write buffer
+                void * buffer_start = (void *)((unsigned char *)curr->source + ovr_offset);
 
-        tx_clear(shared, tx);
-        return false;
+                size_t delta = end_adr > ovr_end_adr ? (size_t)(ovr_end_adr - start_adr + 1): size;
+                byte_wise_atomic_memcpy((void *)private_start_adr,
+                    resolve_addr(shared, buffer_start), 
+                    delta, memory_order_acquire);
+                start_adr += delta;
+                private_start_adr += delta;
+                size -= delta;
+            } else {
+                // read directly
+                byte_wise_atomic_memcpy(target,
+                    resolve_addr(shared, source), 
+                    size, memory_order_acquire);
+                size = 0;
+            }
+        }
         
         v_lock_val = atomic_load(&region->segment_locks[segment_idx]); // posterior lock load
         if(old_lock_v != v_lock_val){

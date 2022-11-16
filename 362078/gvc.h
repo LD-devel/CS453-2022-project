@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shared-lock.h"
+#include <stdlib.h>
 
 /**
  * @brief A simple global version clock guarded by
@@ -22,7 +23,7 @@ bool gvc_init(gvc* clock);
  * @param clock global version clock to be incremented
  * @return Whether the operation is a success
 */
-bool gvc_increment(gvc* clock);
+bool gvc_increment(gvc* clock, uint* value);
 
 /** Read the global version clock
  * @param clock global version clock to be read

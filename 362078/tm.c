@@ -41,6 +41,7 @@ struct write_node {
     void* source;
     size_t size;
     void* target;
+    bool locked;
 };
 typedef struct write_node* write_list;
 
@@ -71,11 +72,12 @@ void insert_read(read_list* reads_ptr, uint16_t segment_idx){
 }
 
 // Write get inserted in a sorted manner and intervals get updated accordingly
-void insert_write(write_list* writes_ptr, void* source,size_t size, void* target){
+void insert_write(write_list* writes_ptr, void const* source,size_t size, void* target){
     struct write_node* n_write = (struct write_node*) malloc(sizeof(struct write_node));
-    n_write->source = source;
+    n_write->source = (void *)source;
     n_write->size = size;
     n_write->target = target;
+    n_write->locked = false;
 
     if(!(*writes_ptr)){
         (*writes_ptr) = n_write;
@@ -141,10 +143,6 @@ typedef struct region
     void* segment_addresses[2^16];
     atomic_uint segment_locks[2^16];
     // TODO: add queue and index freeing mechanism
-
-    // TODO: we need some data-structure to store read write sets
-    // of transactions
-
 } mem_region;
 
 /**
@@ -160,6 +158,19 @@ uint16_t get_seg_index(shared_t shared){
     atomic_thread_fence(memory_order_acquire);
     lock_release(&(region->segments_lock));
     return tmp_ctr;
+}
+
+// tries to lock write node's segment, if locked
+// returns whether successful
+bool lock_node(mem_region* region, struct write_node* node){
+    if(!node->locked){
+        uint16_t segment_idx = (uint16_t)((uint64_t)node->target >> 48);
+        uint v_lock_val = atomic_load(&(region->segment_locks[segment_idx]));
+        if (!(v_lock_val & 1)){
+            node->locked = atomic_compare_exchange_weak(&(region->segment_locks[segment_idx]), &v_lock_val, v_lock_val +1);
+        }
+    }
+    return node->locked;
 }
 
 /**
@@ -238,7 +249,7 @@ shared_t tm_create(size_t size, size_t align) {
         free(region);
         return invalid_shared;
     }
-    region->segment_locks[0] = 0;
+    atomic_store(&(region->segment_locks[0]), 0);
 
     // Init the global version clock for this shared memory region
     // and the lock for the list of segments
@@ -310,12 +321,6 @@ size_t tm_align(shared_t shared) {
 }
 
 /**
- * @brief Translate a virtual memory address to an address
- * specific to the regions memory layout
- * TODO: do we ever need this?
-*/ 
-
-/**
  * @brief Resolve a regional virtual address to a plain virtual 
  * address
  * @param shared Pointer to region providing the memory context
@@ -357,21 +362,101 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared, tx_t tx) {
-    // TODO: tm_end(shared_t, tx_t)
 
     tx_con* transaction = (tx_con *)tx;
     if (transaction->is_ro){
         return true;
     }
+    mem_region* region = (mem_region *)shared;
 
-    //mem_region* region = (mem_region *)shared;
+    // TL2 step 3: lock the write set with bounded spinning
+    bool locked = true;
+    for (size_t i = 0; i < 300; i++){
+        locked = true;
+        struct write_node* curr = transaction->writes;
+        bool first = true;
+        uint16_t segment_idx = 0;
+        while (curr){
+            uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
+            if (first || segment_idx != segment_idx_curr){
+                segment_idx = segment_idx_curr;
+                locked = locked & lock_node(region, curr);
+            }
+            curr = curr->next;
+            first = false;
+        }
+        if (locked) break;
+    }
 
-    // commit all read/alloc/write/free operations
-    // only free memory segments from this transaction,
-    // if they should not remain in the shared memory region
+    // TL2 step 4: increment GVC
+    uint wv;
+    if (!(locked && gvc_increment(&(region->regional_gvc), &wv))){
+        tx_clear(shared, tx);
+        return false;
+    }
+    
+    // TL2 step 5: validate the read set
+    if(transaction->rv + 1 != wv){
+        struct read_node* curr = transaction->reads;
+        while (curr){
+            uint16_t segment_idx = curr->segment_idx;
+            uint v_lock_val = atomic_load(&(region->segment_locks[segment_idx]));
+            bool valid = true;
+            if ((v_lock_val >> 1) > transaction->rv) valid = false;
+            // if segment is locked, check whether it is our own lock
+            else if(v_lock_val & 1) {
+                valid = false;
+                struct write_node* curr_w   = transaction->writes;
+                bool first_w                = true;
+                uint16_t segment_idx_w      = 0;
+                while (curr_w){
+                    uint16_t segment_idx_curr_w = (uint16_t)((uint64_t)curr_w->target >> 48);
+                    if (first_w || segment_idx_w != segment_idx_curr_w){
+                        segment_idx_w = segment_idx_curr_w;
+                        if (segment_idx_w == segment_idx){
+                            valid = true;
+                            break;
+                        }
+                    }
+                    curr_w = curr_w->next;
+                    first_w = false;
+                }
+            }
+            if (!valid){
+                // post-validation failed
+                tx_clear(shared, tx);
+                return false;
+            }
+            curr = curr->next;
+        }
+    }
+
+    // TL2 step 6: commit and release all locks
+    struct write_node* curr = transaction->writes;
+    bool first = true;
+    uint16_t segment_idx = 0;
+    while (curr){
+        // write
+        byte_wise_atomic_memcpy(curr->target, curr->source, curr->size, memory_order_acquire);
+        // if this write is the last of the segment, unlock
+        uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
+        if (!first && segment_idx != segment_idx_curr){
+            // unlock last
+            atomic_store(&(region->segment_locks[segment_idx]), wv<<0);
+        }
+        if (!curr->next){
+            // unlock current
+            atomic_store(&(region->segment_locks[segment_idx_curr]), wv<<0);
+        }
+        segment_idx = segment_idx_curr;
+        curr = curr->next;
+        first = false;
+    }
+
+    // TODO: allocate and free segments correctly
 
     tx_clear(shared, tx);
-    return false;
+    return true;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -409,6 +494,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         while(size != 0){
             // loop through writes until we find a writes ending after our start address
             struct write_node* curr = transaction->writes;
+            // OPTIMIZATION: skip based on segment id
             while (curr && (unsigned char *)curr->target + (curr->size -1) < start_adr){
                 curr = curr->next;
             }
@@ -447,7 +533,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
             }
         }
         
-        v_lock_val = atomic_load(&region->segment_locks[segment_idx]); // posterior lock load
+        v_lock_val = atomic_load(&(region->segment_locks[segment_idx])); // posterior lock load
         if(old_lock_v != v_lock_val){
             tx_clear(shared, tx);
             return false;
@@ -474,10 +560,11 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* unused(source), size_t unused(size), void* unused(target)) {
-    // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
+bool tm_write(shared_t unused(shared), tx_t tx, void const* source, size_t size, void* target) {
+    tx_con* transaction = (tx_con*)tx;
+    insert_write(&(transaction->writes), source, size, target);
     
-    // first check, if this is a segment allocated in  the current transaction
+    // TODO: OPTIONAL first check, if this is a segment allocated in  the current transaction
     return false;
 }
 
@@ -488,7 +575,9 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* unused(sourc
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), void** unused(target)) {
+alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) {
+    mem_region* region = (mem_region *)shared;
+
     // Allocate segment
     // 1. get the alignment from the pointer to the region
     size_t align = ((mem_region*) shared)->align;
@@ -500,8 +589,11 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
     if (unlikely(posix_memalign(&segment, align, size) != 0)) return nomem_alloc; // Failed allocation!
 
     // store our address in the huge array of all addresses
-    uint16_t segment_index = get_seg_index(shared);
-    ((struct region*)shared)->segment_addresses[segment_index] = segment;
+    uint16_t segment_idx = get_seg_index(shared);
+    ((struct region*)shared)->segment_addresses[segment_idx] = segment;
+    // initialize the lock
+    atomic_store(&(region->segment_locks[segment_idx]), 0);
+    // TODO: book-keep that we have not yet commited this allocation
 
     // 0 everything and set target
     memset(segment, 0, size);
@@ -517,7 +609,5 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
 **/
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
     // TODO: add this to a list of segments that will be freed upon commit
-    // if this is in the set of just uncommited allocations, we can free directly
-
-    return false;
+    return true;
 }

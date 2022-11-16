@@ -2,17 +2,18 @@
 #include "shared-lock.h"
 
 #include "macros.h"
+#include <stdlib.h>
 
 bool gvc_init(gvc* clock){
     clock->time = 0;
     return shared_lock_init(&(clock->lock));
 }
 
-bool gvc_increment(gvc* clock){
+bool gvc_increment(gvc* clock, uint* value){
     if(unlikely(!shared_lock_acquire(&(clock->lock))))
         return false;
     
-    clock->time++;
+    *value = ++(clock->time);
     shared_lock_release(&(clock->lock));
     return true;
 }

@@ -174,6 +174,16 @@ bool lock_node(mem_region* region, struct write_node* node){
     return node->locked;
 }
 
+// unlocks locked nodes corresponding segment lock
+void unlock_node(mem_region* region, struct write_node* node){
+    if(node->locked){
+        uint16_t segment_idx = (uint16_t)((uint64_t)node->target >> 48);
+        uint v_lock_val = atomic_load(&(region->segment_locks[segment_idx]));
+        atomic_store(&(region->segment_locks[segment_idx]), v_lock_val - 1);
+        node->locked = false;
+    }
+}
+
 /**
  * Memcpy but bite-wise atomic.
  * This allows for undefined content when called concurrently,
@@ -369,6 +379,7 @@ bool tm_end(shared_t shared, tx_t tx) {
 
     tx_con* transaction = (tx_con *)tx;
     if (transaction->is_ro){
+        printf("Read only success. \n");
         return true;
     }
     mem_region* region = (mem_region *)shared;
@@ -384,17 +395,32 @@ bool tm_end(shared_t shared, tx_t tx) {
             uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
             if (first || segment_idx != segment_idx_curr){
                 segment_idx = segment_idx_curr;
-                locked = locked & lock_node(region, curr);
+                locked = locked && lock_node(region, curr);
             }
             curr = curr->next;
             first = false;
         }
         if (locked) break;
     }
+    // If not all locks could be acquired, unlock the locked locks
+    if(!locked){
+        struct write_node* curr = transaction->writes;
+        bool first = true;
+        uint16_t segment_idx = 0;
+        while (curr){
+            uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
+            if (first || segment_idx != segment_idx_curr){
+                segment_idx = segment_idx_curr;
+                unlock_node(region, curr);
+            }
+            curr = curr->next;
+            first = false;
+        }
+    }
 
     // TL2 step 4: increment GVC
     uint wv;
-    if (!(locked && gvc_increment(&(region->regional_gvc), &wv))){
+    if (!gvc_increment(&(region->regional_gvc), &wv)){
         tx_clear(shared, tx);
         return false;
     }

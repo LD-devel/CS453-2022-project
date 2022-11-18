@@ -21,6 +21,7 @@
 #endif
 
 // External headers
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -201,17 +202,20 @@ void tx_clear(shared_t unused(shared), tx_t tx){
             struct read_node* curr = transaction->reads;
             while (curr->next){
                 struct read_node* old = curr;
-                struct read_node* curr = curr->next;
+                curr = curr->next;
                 free(old);
             }
+            free(curr);
         }        
         if (transaction->writes){
             struct write_node* curr = transaction->writes;
             while (curr->next){
                 struct write_node* old = curr;
-                struct write_node* curr = curr->next;
+                curr = curr->next;
+                //printf("%p , %p \n", (void *)tx, old);
                 free(old);
             }
+            free(curr);
         }
     }
     free(transaction);
@@ -437,7 +441,7 @@ bool tm_end(shared_t shared, tx_t tx) {
     uint16_t segment_idx = 0;
     while (curr){
         // write
-        byte_wise_atomic_memcpy(curr->target, curr->source, curr->size, memory_order_acquire);
+        byte_wise_atomic_memcpy(resolve_addr(shared,curr->target), curr->source, curr->size, memory_order_acquire);
         // if this write is the last of the segment, unlock
         uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
         if (!first && segment_idx != segment_idx_curr){
@@ -565,7 +569,7 @@ bool tm_write(shared_t unused(shared), tx_t tx, void const* source, size_t size,
     insert_write(&(transaction->writes), source, size, target);
     
     // TODO: OPTIONAL first check, if this is a segment allocated in  the current transaction
-    return false;
+    return true;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.

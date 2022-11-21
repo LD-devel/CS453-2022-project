@@ -20,6 +20,9 @@
     #error Current C11 compiler does not support atomic operations
 #endif
 
+// Change to print debugging info
+#define DEBUG 1
+
 // External headers
 #include <stdio.h>
 #include <stdlib.h>
@@ -176,12 +179,24 @@ bool lock_node(mem_region* region, struct write_node* node){
 }
 
 // unlocks locked nodes corresponding segment lock
-void unlock_node(mem_region* region, struct write_node* node){
-    if(node->locked){
-        uint16_t segment_idx = (uint16_t)((uint64_t)node->target >> 48);
-        uint v_lock_val = atomic_load(&(region->segment_locks[segment_idx]));
-        atomic_store(&(region->segment_locks[segment_idx]), v_lock_val - 1);
-        node->locked = false;
+void unlock_all(mem_region* region, tx_con* transaction){
+    struct write_node* curr = transaction->writes;
+    bool first = true;
+    uint16_t segment_idx = 0;
+    while (curr){
+        uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
+        if (first || segment_idx != segment_idx_curr){
+            segment_idx = segment_idx_curr;
+            //unlock_node(region, curr);
+            if(curr->locked){
+                uint16_t segment_idx = (uint16_t)((uint64_t)curr->target >> 48);
+                uint v_lock_val = atomic_load(&(region->segment_locks[segment_idx]));
+                atomic_store(&(region->segment_locks[segment_idx]), v_lock_val - 1);
+                curr->locked = false;
+            }
+        }
+        curr = curr->next;
+        first = false;
     }
 }
 
@@ -269,11 +284,11 @@ shared_t tm_create(size_t size, size_t align) {
 
     // Try to allocate the first non-fee-able segment of the 
     // shared memory region
-    if (posix_memalign(&(region->segment_addresses[0]), align, size) != 0) {
+    if (posix_memalign(&(region->segment_addresses[1]), align, size) != 0) {
         free(region);
         return invalid_shared;
     }
-    atomic_store(&(region->segment_locks[0]), 0);
+    atomic_store(&(region->segment_locks[1]), 0);
 
     // Init the global version clock for this shared memory region
     // and the lock for the list of segments
@@ -287,7 +302,7 @@ shared_t tm_create(size_t size, size_t align) {
     // 0 over the start memory segment
     // TODO: do we actually need to do this? 
     // possible performance drag
-    memset(region->segment_addresses[0], 0, size);
+    memset(region->segment_addresses[1], 0, size);
 
     // Set all remaining context in fo in region and return it's pointer
     // TODO: init queue for allocation index feeder
@@ -295,7 +310,7 @@ shared_t tm_create(size_t size, size_t align) {
     region->size                 = size;
     region->versioned_mem_lock   = 0;
     region->align                = align;
-    region->ctr                  = 1; // The first index is reserved
+    region->ctr                  = 2; // The first index is reserved
     return region;
 }
 
@@ -324,8 +339,11 @@ void tm_destroy(shared_t shared) {
  * @return Start address of the first allocated segment
 **/
 void* tm_start(shared_t unused(shared)) {
-    // TODO: this is a bit sketchy with the null-pointer and what not
-    return (void *)0;
+    void* pointer = (void *)(((uint64_t) 1u) << 48);
+    #if DEBUG
+    printf("start: %p \n", pointer);
+    #endif
+    return pointer;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -354,7 +372,10 @@ size_t tm_align(shared_t shared) {
 void* resolve_addr(shared_t shared, void const* ptr) {
     //offset: 0x0FFF && ptr;
     //index: 48 >> ptr
-    return (void*)((uint64_t)((mem_region *) shared)->segment_addresses[(uint16_t) ((uint64_t) ptr >> 48)] + (uint64_t)(0x0FFF && ptr));
+    void* real_base = ((mem_region *) shared)->segment_addresses[((uint64_t) ptr >> 48)];
+    uint64_t vv_base = (((uint64_t) ptr) >> 48) << 48;
+    uint64_t delta = ((uint64_t) ptr) - vv_base;
+    return (void*)(((uint64_t) real_base) + delta);
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
@@ -390,7 +411,9 @@ bool tm_end(shared_t shared, tx_t tx) {
     tx_con* transaction = (tx_con *)tx;
     if (transaction->is_ro){
         tx_clear(shared, tx, false);
+        #if DEBUG
         printf("Read succeeded. \n");
+        #endif
         return true;
     }
     mem_region* region = (mem_region *)shared;
@@ -415,21 +438,12 @@ bool tm_end(shared_t shared, tx_t tx) {
     }
     // If not all locks could be acquired, unlock the locked locks
     if(!locked){
-        struct write_node* curr = transaction->writes;
-        bool first = true;
-        uint16_t segment_idx = 0;
-        while (curr){
-            uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
-            if (first || segment_idx != segment_idx_curr){
-                segment_idx = segment_idx_curr;
-                unlock_node(region, curr);
-            }
-            curr = curr->next;
-            first = false;
-        }
+        unlock_all(region, transaction);
         tx_clear(shared, tx, true);
-        return false;
+        #if DEBUG
         printf("Write failed locking. \n");
+        #endif
+        return false;
     }
 
     // TL2 step 4: increment GVC
@@ -468,8 +482,11 @@ bool tm_end(shared_t shared, tx_t tx) {
             }
             if (!valid){
                 // post-validation failed
-                printf("Post validation failed. \n");
+                unlock_all(region, transaction);
                 tx_clear(shared, tx, true);
+                #if DEBUG
+                printf("Post validation failed. \n");
+                #endif
                 return false;
             }
             curr = curr->next;
@@ -499,7 +516,9 @@ bool tm_end(shared_t shared, tx_t tx) {
     }
 
     // TODO: allocate and free segments correctly
+    #if DEBUG
     printf("Write succeeded. \n");
+    #endif
     tx_clear(shared, tx, false);
     return true;
 }
@@ -518,7 +537,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     tx_con* transaction = (tx_con *)tx;
     uint16_t segment_idx = (uint16_t)((uint64_t) source >> 48);
     uint v_lock_val;
-
+    //printf("read: %p , resolved: %p \n", source, resolve_addr(shared, source));
     if (likely(transaction->is_ro)){
         // read directly
         byte_wise_atomic_memcpy(target,
@@ -571,9 +590,16 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
                 size -= delta;
             } else {
                 // read directly
+                #if DEBUG
+                //if (!(transaction->is_ro)) printf("rw Direct single read spec. attempt, segment id %d %p. \n", segment_idx, target);
+                //if ((transaction->is_ro)) printf("ro Direct single read spec. attempt. \n");
+                #endif
                 byte_wise_atomic_memcpy(target,
                     resolve_addr(shared, source), 
                     size, memory_order_acquire);
+                #if DEBUG
+                //if (!(transaction->is_ro)) printf("Done\n");
+                #endif
                 size = 0;
             }
         }
@@ -642,7 +668,10 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) {
 
     // 0 everything and set target
     memset(segment, 0, size);
-    *target = segment;
+    *target = (void *)(((uint64_t) segment_idx) << 48);
+    #if DEBUG
+    printf(" Other than first segment allocated! %p \n", segment);
+    #endif
     return success_alloc;
 }
 

@@ -131,7 +131,8 @@ void insert_write(write_list* writes_ptr, void const* source,size_t size, void* 
 typedef struct region
 {
     // We use one global version clock per shared memory region
-    gvc regional_gvc;
+    //gvc regional_gvc;
+    atomic_uint gvc;
     // TODO: create a fine-grained lock to be able to lock a write set
     void* start;    // Start of the shared memory region
     size_t size;    // Size of the first memory segment (in bytes)
@@ -200,11 +201,20 @@ void byte_wise_atomic_memcpy(void const* dest, void const* source, size_t count,
 /**
 * Clean up after transaction
 */
-void tx_clear(shared_t unused(shared), tx_t tx){
+void tx_clear(shared_t unused(shared), tx_t tx, bool unused(fail)){
 
     tx_con* transaction = (tx_con*)tx;
     // TODO: Free all memory segments that have not been commited yet
     // and hand back their index
+    /*if (transaction->is_ro && !fail) printf("Read only success. \n");
+    else if (transaction->is_ro && fail) {
+        printf("Read only fail. \n");
+    }
+    else if (!transaction->is_ro && !fail) printf("Write success. \n");
+    else 
+    if (!transaction->is_ro && fail) {
+        printf("Write fail. \n");
+    }*/
 
     if (!transaction->is_ro){
         // Free the read and write set
@@ -267,8 +277,8 @@ shared_t tm_create(size_t size, size_t align) {
 
     // Init the global version clock for this shared memory region
     // and the lock for the list of segments
-    if (!gvc_init(&(region->regional_gvc)) ||
-        !lock_init(&(region->segments_lock))) {
+    atomic_store(&(region->gvc),0);
+    if (!lock_init(&(region->segments_lock))) {
         free(region->start);
         free(region);
         return invalid_shared;
@@ -304,7 +314,7 @@ void tm_destroy(shared_t shared) {
     }
     
     free(region->segment_addresses[0]); // free the non-free-able 
-    gvc_clean_up(&(region->regional_gvc));
+    //gvc_clean_up(&(region->regional_gvc));
     lock_cleanup(&(region->segments_lock));
     free(region); // free region last
 }
@@ -363,8 +373,8 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         return invalid_tx;
     }
     mem_region* region = (mem_region *)shared;
-    gvc_read(&(region->regional_gvc), &tx_new->rv); // sample GVC
-    tx_new->is_ro = is_ro;                          // store is_ro
+    tx_new->rv = atomic_load(&(region->gvc)); // sample GVC
+    tx_new->is_ro = is_ro;                    // store is_ro
     tx_new->reads = NULL;
     tx_new->writes = NULL;
     return (tx_t) tx_new;
@@ -379,7 +389,8 @@ bool tm_end(shared_t shared, tx_t tx) {
 
     tx_con* transaction = (tx_con *)tx;
     if (transaction->is_ro){
-        printf("Read only success. \n");
+        tx_clear(shared, tx, false);
+        printf("Read succeeded. \n");
         return true;
     }
     mem_region* region = (mem_region *)shared;
@@ -416,14 +427,17 @@ bool tm_end(shared_t shared, tx_t tx) {
             curr = curr->next;
             first = false;
         }
+        tx_clear(shared, tx, true);
+        return false;
+        printf("Write failed locking. \n");
     }
 
     // TL2 step 4: increment GVC
-    uint wv;
-    if (!gvc_increment(&(region->regional_gvc), &wv)){
-        tx_clear(shared, tx);
+    uint wv = atomic_fetch_add(&(region->gvc),1) + 1;
+    /*if (!gvc_increment(&(region->regional_gvc), &wv)){
+        tx_clear(shared, tx, true);
         return false;
-    }
+    }*/
     
     // TL2 step 5: validate the read set
     if(transaction->rv + 1 != wv){
@@ -454,7 +468,8 @@ bool tm_end(shared_t shared, tx_t tx) {
             }
             if (!valid){
                 // post-validation failed
-                tx_clear(shared, tx);
+                printf("Post validation failed. \n");
+                tx_clear(shared, tx, true);
                 return false;
             }
             curr = curr->next;
@@ -472,11 +487,11 @@ bool tm_end(shared_t shared, tx_t tx) {
         uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
         if (!first && segment_idx != segment_idx_curr){
             // unlock last
-            atomic_store(&(region->segment_locks[segment_idx]), wv<<0);
+            atomic_store(&(region->segment_locks[segment_idx]), wv<<1);
         }
         if (!curr->next){
             // unlock current
-            atomic_store(&(region->segment_locks[segment_idx_curr]), wv<<0);
+            atomic_store(&(region->segment_locks[segment_idx_curr]), wv<<1);
         }
         segment_idx = segment_idx_curr;
         curr = curr->next;
@@ -484,8 +499,8 @@ bool tm_end(shared_t shared, tx_t tx) {
     }
 
     // TODO: allocate and free segments correctly
-
-    tx_clear(shared, tx);
+    printf("Write succeeded. \n");
+    tx_clear(shared, tx, false);
     return true;
 }
 
@@ -565,7 +580,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         
         v_lock_val = atomic_load(&(region->segment_locks[segment_idx])); // posterior lock load
         if(old_lock_v != v_lock_val){
-            tx_clear(shared, tx);
+            tx_clear(shared, tx, true);
             return false;
         }
     }
@@ -574,7 +589,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     //   and that the version of the lock is <= rv
     if ((v_lock_val & 1) || ((v_lock_val >> 1) > transaction->rv)){
         // post-validation failed
-        tx_clear(shared, tx);
+        tx_clear(shared, tx, true);
         return false;
     }
     return true;

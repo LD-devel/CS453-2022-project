@@ -21,7 +21,9 @@
 #endif
 
 // Change to print debugging info
-#define DEBUG 1
+#define DEBUG 0
+#define DEBUG_DET 0
+#define DEBUG_ADDR 0
 
 // External headers
 #include <stdio.h>
@@ -68,6 +70,10 @@ typedef struct transaction_context {
 
 // Reads simply get inserted at the start of the list
 void insert_read(read_list* reads_ptr, uint16_t segment_idx){
+    #if DEBUG_DET
+    printf("Insert read \n");
+    #endif
+
     struct read_node* n_read = (struct read_node*) malloc(sizeof(struct read_node));
     n_read->next = *reads_ptr;
     n_read->prev = NULL;
@@ -76,56 +82,97 @@ void insert_read(read_list* reads_ptr, uint16_t segment_idx){
 }
 
 // Write get inserted in a sorted manner and intervals get updated accordingly
-void insert_write(write_list* writes_ptr, void const* source,size_t size, void* target){
+void insert_write(write_list* writes_ptr, void const* source, size_t size, void* target){
+    #if 0
+    printf("Insert write \t %p \t %p \n", target, source);
+    #endif
+
     struct write_node* n_write = (struct write_node*) malloc(sizeof(struct write_node));
     n_write->source = (void *)source;
     n_write->size = size;
     n_write->target = target;
     n_write->locked = false;
+    n_write->prev = NULL;
+    n_write->next = NULL;
 
-    if(!(*writes_ptr)){
+    if(!(*writes_ptr)){ // In case the list is empty so far
+        #if DEBUG_DET
+        printf("insert_write 0-1 %p \n", writes_ptr);
+        #endif
         (*writes_ptr) = n_write;
         return;
     }
 
     // find the correct slot to insert
     // we ensure that prev<new and next>=new
+    #if DEBUG_DET
+    printf("insert_write 1 \t %p \n", writes_ptr);
+    #endif
     struct write_node* prev = NULL;
     struct write_node* next = *writes_ptr;
+    #if DEBUG_DET
+    printf("insert_write 1-1 %p \n", writes_ptr);
+    #endif
     while (next && next->target < target){
+        #if DEBUG_DET
+        printf("insert_write 1-1.0 %p prev: %p next %p \n", writes_ptr, prev, next);
+        #endif
         prev = next;
+        #if DEBUG_DET
+        printf("insert_write 1-1.1 %p prev: %p next %p \n", writes_ptr, prev, next);
+        #endif
         next = next->next;
+        #if DEBUG_DET
+        printf("insert_write 1-1.2 %p prev: %p next %p \n", writes_ptr, prev, next);
+        #endif
     }
-    if(prev) prev->next = n_write;
+    #if DEBUG_DET
+    printf("insert_write 1-2 \t %p \n", writes_ptr);
+    #endif
+    if(prev) {
+        prev->next = n_write;
+    } else { // if there is no previous element, this is the first in the list
+        (*writes_ptr) = n_write;
+    }
     n_write->prev = prev;
     n_write->next = next;
     if(next) next->prev = n_write;
 
+    #if DEBUG_DET
+    printf("insert_write 2 \t %p \n", writes_ptr);
+    #endif
     // update bounds of prev
     if(prev){
-        unsigned char* prev_end = (unsigned char *)prev->target + (prev->size -1);
-        unsigned char* new_start = (unsigned char *)n_write->target;
+        uintptr_t prev_end = (uintptr_t)prev->target + (prev->size -1);
+        uintptr_t new_start = (uintptr_t)n_write->target;
         if(prev_end >= new_start){
             prev->size = prev->size - (prev_end - new_start +1);
         }
     }
     // remove next if necessary
-    unsigned char* new_end = (unsigned char *)n_write->target + (n_write->size -1);
-    while(next && ((unsigned char *)next->target + (next->size -1)) <= new_end){
+    uintptr_t new_end = (uintptr_t)n_write->target + (n_write->size -1);
+    while(next && ((uintptr_t)next->target + (next->size -1)) <= new_end){
         n_write->next = next->next;
         free(next);
         next = n_write->next;
     }
+    
+    #if DEBUG_DET
+    printf("insert_write 3 \t %p \n", writes_ptr);
+    #endif
     // update next's target address and size if necessary
     if(next){
-        unsigned char * next_start = (unsigned char *)next->target;
+        uintptr_t next_start = (uintptr_t)next->target;
         if(next_start <= new_end){
             size_t delta = (new_end - next_start) + 1;
             next->target = (void*)(new_end + 1);
             next->size = next->size - delta;
-            next->source = (void*)((unsigned char *)next->source + delta);
+            next->source = (void*)((uintptr_t)next->source + delta);
         }
     }
+    #if DEBUG_DET
+    printf("insert_write 4 \t %p \n", writes_ptr);
+    #endif
 }
 
 /**
@@ -171,7 +218,7 @@ bool lock_node(mem_region* region, struct write_node* node){
     if(!node->locked){
         uint16_t segment_idx = (uint16_t)((uint64_t)node->target >> 48);
         uint v_lock_val = atomic_load(&(region->segment_locks[segment_idx]));
-        if (!(v_lock_val & 1)){
+        if (!(v_lock_val & 1u)){
             node->locked = atomic_compare_exchange_weak(&(region->segment_locks[segment_idx]), &v_lock_val, v_lock_val +1);
         }
     }
@@ -339,7 +386,7 @@ void tm_destroy(shared_t shared) {
  * @return Start address of the first allocated segment
 **/
 void* tm_start(shared_t unused(shared)) {
-    void* pointer = (void *)(((uint64_t) 1u) << 48);
+    void* pointer = (void *)(((uintptr_t) 1u) << 48);
     #if DEBUG
     printf("start: %p \n", pointer);
     #endif
@@ -372,10 +419,14 @@ size_t tm_align(shared_t shared) {
 void* resolve_addr(shared_t shared, void const* ptr) {
     //offset: 0x0FFF && ptr;
     //index: 48 >> ptr
-    void* real_base = ((mem_region *) shared)->segment_addresses[((uint64_t) ptr >> 48)];
-    uint64_t vv_base = (((uint64_t) ptr) >> 48) << 48;
-    uint64_t delta = ((uint64_t) ptr) - vv_base;
-    return (void*)(((uint64_t) real_base) + delta);
+    void* real_base = ((mem_region *) shared)->segment_addresses[((uintptr_t) ptr >> 48)];
+    uint64_t vv_base = (((uintptr_t) ptr) >> 48) << 48;
+    uint64_t delta = ((uintptr_t) ptr) - vv_base;
+    void* res = (void*)(((uintptr_t) real_base) + delta);
+    #if DEBUG_ADDR
+    printf("%p \t \t -> %p\n", ptr, res);
+    #endif
+    return res;
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
@@ -384,6 +435,10 @@ void* resolve_addr(shared_t shared, void const* ptr) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared, bool is_ro) {
+    #if DEBUG
+    printf("tm_begin\n");
+    #endif
+
 
     // TODO: Do we have to register the transaction with the region
     // for some reason? I don't see yet why we would.
@@ -407,6 +462,9 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared, tx_t tx) {
+    #if DEBUG
+    printf("tm_end\n");
+    #endif
 
     tx_con* transaction = (tx_con *)tx;
     if (transaction->is_ro){
@@ -462,7 +520,7 @@ bool tm_end(shared_t shared, tx_t tx) {
             bool valid = true;
             if ((v_lock_val >> 1) > transaction->rv) valid = false;
             // if segment is locked, check whether it is our own lock
-            else if(v_lock_val & 1) {
+            else if(v_lock_val & 1u) {
                 valid = false;
                 struct write_node* curr_w   = transaction->writes;
                 bool first_w                = true;
@@ -499,6 +557,9 @@ bool tm_end(shared_t shared, tx_t tx) {
     uint16_t segment_idx = 0;
     while (curr){
         // write
+        #if 1
+        //printf("Execute write \t %p \t %p \n", curr->target, curr->source);
+        #endif
         byte_wise_atomic_memcpy(resolve_addr(shared,curr->target), curr->source, curr->size, memory_order_acquire);
         // if this write is the last of the segment, unlock
         uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
@@ -536,6 +597,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     mem_region* region = (mem_region *)shared;
     tx_con* transaction = (tx_con *)tx;
     uint16_t segment_idx = (uint16_t)((uint64_t) source >> 48);
+    //printf("segment: %d \n", segment_idx);
     uint v_lock_val;
     //printf("read: %p , resolved: %p \n", source, resolve_addr(shared, source));
     if (likely(transaction->is_ro)){
@@ -552,20 +614,20 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         // check if read overlaps with write set
         // perform the corresponding read operations
         // calc start&end address
-        unsigned char* start_adr = (unsigned char *)source;
-        unsigned char* end_adr = (unsigned char *)source + (size -1);
-        unsigned char* private_start_adr = (unsigned char *)target;
+        uintptr_t start_adr = (uintptr_t)source;
+        uintptr_t end_adr = (uintptr_t)source + (size -1);
+        uintptr_t private_start_adr = (uintptr_t)target;
         while(size != 0){
             // loop through writes until we find a writes ending after our start address
             struct write_node* curr = transaction->writes;
             // OPTIMIZATION: skip based on segment id
-            while (curr && (unsigned char *)curr->target + (curr->size -1) < start_adr){
+            while (curr && (uintptr_t)curr->target + (curr->size -1) < start_adr){
                 curr = curr->next;
             }
             // make sure that the write is not beyond our read
-            if (curr && (unsigned char *)curr->target <= end_adr){
-                unsigned char* ovr_start_adr = (unsigned char *)curr->target;
-                unsigned char* ovr_end_adr = ovr_start_adr + curr->size;
+            if (curr && (uintptr_t)curr->target <= end_adr){
+                uintptr_t ovr_start_adr = (uintptr_t)curr->target;
+                uintptr_t ovr_end_adr = ovr_start_adr + curr->size;
                 // copy from shared region if the overlap starts after our source
                 if ( start_adr < ovr_start_adr){
                     size_t delta = ovr_start_adr - start_adr; // TODO:double check
@@ -579,7 +641,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
                 // now overwritten_start <= start_adr
                 size_t ovr_offset = ovr_start_adr < start_adr ? start_adr - ovr_start_adr : 0;
                 // copy from write buffer
-                void * buffer_start = (void *)((unsigned char *)curr->source + ovr_offset);
+                void * buffer_start = (void *)((uintptr_t)curr->source + ovr_offset);
 
                 size_t delta = end_adr > ovr_end_adr ? (size_t)(ovr_end_adr - start_adr + 1): size;
                 byte_wise_atomic_memcpy((void *)private_start_adr,
@@ -590,10 +652,6 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
                 size -= delta;
             } else {
                 // read directly
-                #if DEBUG
-                //if (!(transaction->is_ro)) printf("rw Direct single read spec. attempt, segment id %d %p. \n", segment_idx, target);
-                //if ((transaction->is_ro)) printf("ro Direct single read spec. attempt. \n");
-                #endif
                 byte_wise_atomic_memcpy(target,
                     resolve_addr(shared, source), 
                     size, memory_order_acquire);
@@ -613,7 +671,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     // post-validation
     //   check that the lock is free
     //   and that the version of the lock is <= rv
-    if ((v_lock_val & 1) || ((v_lock_val >> 1) > transaction->rv)){
+    if ((v_lock_val & 1u) || ((v_lock_val >> 1) > transaction->rv)){
         // post-validation failed
         tx_clear(shared, tx, true);
         return false;
@@ -647,6 +705,9 @@ bool tm_write(shared_t unused(shared), tx_t tx, void const* source, size_t size,
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
 alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) {
+    #if DEBUG
+    printf("tm_alloc 0\n");
+    #endif
     mem_region* region = (mem_region *)shared;
 
     // Allocate segment
@@ -657,7 +718,8 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) {
     // sn is a pointer to a segment_node
     // we cast that into a pointer to a memory word (void**)
     void* segment;
-    if (unlikely(posix_memalign(&segment, align, size) != 0)) return nomem_alloc; // Failed allocation!
+    if (unlikely(posix_memalign(&segment, align, size) != 0))
+        return nomem_alloc; // Failed allocation!
 
     // store our address in the huge array of all addresses
     uint16_t segment_idx = get_seg_index(shared);
@@ -682,6 +744,9 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) {
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
+    #if DEBUG
+    printf("tm_free \n");
+    #endif
     // TODO: add this to a list of segments that will be freed upon commit
     return true;
 }

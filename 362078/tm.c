@@ -23,7 +23,7 @@
 // Change to print debugging info
 #define DEBUG 0
 #define DEBUG_DET 0
-#define DEBUG_ADDR 0
+#define DEBUG_ADDR 1
 
 // External headers
 #include <stdio.h>
@@ -596,8 +596,8 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
     mem_region* region = (mem_region *)shared;
     tx_con* transaction = (tx_con *)tx;
-    uint16_t segment_idx = (uint16_t)((uint64_t) source >> 48);
-    //printf("segment: %d \n", segment_idx);
+    uint16_t segment_idx = (uint16_t)((uintptr_t) source >> 48);
+    printf("segment: %d from ptr %p \n", segment_idx, source);
     uint v_lock_val;
     //printf("read: %p , resolved: %p \n", source, resolve_addr(shared, source));
     if (likely(transaction->is_ro)){
@@ -639,14 +639,15 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
                     size -= delta;
                 }
                 // now overwritten_start <= start_adr
-                size_t ovr_offset = ovr_start_adr < start_adr ? start_adr - ovr_start_adr : 0;
+                uintptr_t ovr_offset = ovr_start_adr < start_adr ? (start_adr - ovr_start_adr) : 0;
                 // copy from write buffer
-                void * buffer_start = (void *)((uintptr_t)curr->source + ovr_offset);
+                void* buffer_start = (void *)((uintptr_t)curr->source + ovr_offset);
 
                 size_t delta = end_adr > ovr_end_adr ? (size_t)(ovr_end_adr - start_adr + 1): size;
-                byte_wise_atomic_memcpy((void *)private_start_adr,
-                    resolve_addr(shared, buffer_start), 
-                    delta, memory_order_acquire);
+                //copy from own private buffer - no resolution or checking needed
+                printf("internal copy from ptr %p to %p \n", (void *)private_start_adr, buffer_start);
+                memcpy((void *)private_start_adr, buffer_start, delta);
+                
                 start_adr += delta;
                 private_start_adr += delta;
                 size -= delta;

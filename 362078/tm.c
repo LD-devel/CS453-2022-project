@@ -21,9 +21,9 @@
 #endif
 
 // Change to print debugging info
-#define DEBUG 0
+#define DEBUG 1
 #define DEBUG_DET 0
-#define DEBUG_ADDR 1
+#define DEBUG_ADDR 0
 
 // External headers
 #include <stdio.h>
@@ -45,7 +45,7 @@ struct write_node {
     struct write_node* prev;
     struct write_node* next;
     void* source;
-    size_t size;
+    size_t size; // size of the relevant write, after potential overwrites
     void* target;
     bool locked;
 };
@@ -84,7 +84,7 @@ void insert_read(read_list* reads_ptr, uint16_t segment_idx){
 // Write get inserted in a sorted manner and intervals get updated accordingly
 void insert_write(write_list* writes_ptr, void const* source, size_t size, void* target){
     #if 0
-    printf("Insert write \t %p \t %p \n", target, source);
+    printf("Insert write \t %p from write buffer: %p \n", target, source);
     #endif
 
     struct write_node* n_write = (struct write_node*) malloc(sizeof(struct write_node));
@@ -264,6 +264,9 @@ void byte_wise_atomic_memcpy(void const* dest, void const* source, size_t count,
 * Clean up after transaction
 */
 void tx_clear(shared_t unused(shared), tx_t tx, bool unused(fail)){
+    #if DEBUG
+    printf("clearing transaction \n");
+    #endif
 
     tx_con* transaction = (tx_con*)tx;
     // TODO: Free all memory segments that have not been commited yet
@@ -294,9 +297,11 @@ void tx_clear(shared_t unused(shared), tx_t tx, bool unused(fail)){
             while (curr->next){
                 struct write_node* old = curr;
                 curr = curr->next;
-                //printf("%p , %p \n", (void *)tx, old);
+                // free the copy of the write buffer
+                free(old->source);
                 free(old);
             }
+            free(curr->source);
             free(curr);
         }
     }
@@ -597,7 +602,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     mem_region* region = (mem_region *)shared;
     tx_con* transaction = (tx_con *)tx;
     uint16_t segment_idx = (uint16_t)((uintptr_t) source >> 48);
-    printf("segment: %d from ptr %p \n", segment_idx, source);
+    //printf("read segment: %d from ptr %p to buffer %p \n", segment_idx, source, target);
     uint v_lock_val;
     //printf("read: %p , resolved: %p \n", source, resolve_addr(shared, source));
     if (likely(transaction->is_ro)){
@@ -645,7 +650,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 
                 size_t delta = end_adr > ovr_end_adr ? (size_t)(ovr_end_adr - start_adr + 1): size;
                 //copy from own private buffer - no resolution or checking needed
-                printf("internal copy from ptr %p to %p \n", (void *)private_start_adr, buffer_start);
+                //printf("internal copy from ptr %p to %p \n",buffer_start ,(void *)private_start_adr);
                 memcpy((void *)private_start_adr, buffer_start, delta);
                 
                 start_adr += delta;
@@ -692,7 +697,12 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 **/
 bool tm_write(shared_t unused(shared), tx_t tx, void const* source, size_t size, void* target) {
     tx_con* transaction = (tx_con*)tx;
-    insert_write(&(transaction->writes), source, size, target);
+    //printf("write from write buffer: %p \n", source);
+    
+    //first copy the write buffer
+    void* src_cpy = malloc(size);
+    memcpy(src_cpy, source, size);
+    insert_write(&(transaction->writes), src_cpy, size, target);
     
     // TODO: OPTIONAL first check, if this is a segment allocated in  the current transaction
     return true;

@@ -61,6 +61,7 @@ struct write_node {
     struct write_node* prev;
     struct write_node* next;
     void* source;
+    bool tbf;
     size_t size; // size of the relevant write, after potential overwrites
     void* target;
     bool locked;
@@ -83,6 +84,10 @@ typedef struct transaction_context {
     read_list reads;
     write_list writes;
     seg_idx* allocations;
+    size_t buffer_space;
+    uint ctr;
+    uint64_t buffer_w1;
+    uint64_t buffer_w2;
 } tx_con;
 
 // Reads simply get inserted at the start of the list
@@ -99,13 +104,14 @@ void insert_read(read_list* reads_ptr, uint16_t segment_idx){
 }
 
 // Write get inserted in a sorted manner and intervals get updated accordingly
-void insert_write(write_list* writes_ptr, void const* source, size_t size, void* target){
+void insert_write(write_list* writes_ptr, void const* source, size_t size, void* target, bool tbf){
     #if DEBUG_DET
     printf("insert_write\n");
     #endif
 
     struct write_node* n_write = (struct write_node*) malloc(sizeof(struct write_node));
     n_write->source = (void *)source;
+    n_write->tbf = tbf;
     n_write->size = size;
     n_write->target = target;
     n_write->locked = false;
@@ -211,6 +217,7 @@ typedef struct region
     uint16_t ctr;
     void* segment_addresses[65536]; // This should correspond to 2^16 entries
     atomic_uint segment_locks[65536];
+    void* segment_locks_ptr[65536];
     seg_idx* available_idx;
 } mem_region;
 
@@ -322,11 +329,12 @@ void unlock_all(mem_region* region, tx_con* transaction){
  * This allows for undefined content when called concurrently,
  * but no undefined behaviour.
 */
-void byte_wise_atomic_memcpy(void const* dest, void const* source, size_t count, memory_order order){
-    for (size_t i = 0; i < count; ++i) {
+void byte_wise_atomic_memcpy(void* dest, void* source, size_t count, memory_order order){
+    memcpy(dest, source, count);
+    /*for (size_t i = 0; i < count; ++i) {
         ((char*)(dest))[i] =
             atomic_load_explicit(((char*)(source))+i, order);
-    }
+    }*/
     atomic_thread_fence(order);
 }
 
@@ -340,22 +348,22 @@ void tx_clear(shared_t shared, tx_t tx, bool fail){
 
     //mem_region* region = (mem_region *)shared;
     tx_con* transaction = (tx_con*)tx;
-    // if fail, free all allocs
-    // if !fail, free all frees -> done in tm_end via write nodes
-    // free the data structures in any case
-    seg_idx* curr = transaction->allocations;
-    while(curr){
-        seg_idx* old = curr;
-        curr = curr->next;
-        if(fail) {
-            //free(region->segment_addresses[old->index]);
-            free_seg_index(shared, old->index);
-        }
-        //printf("free 1 %p \n", old);
-        free(old);
-    }
 
-    if (!transaction->is_ro){
+    if (unlikely(!transaction->is_ro)){    
+        // if fail, free all allocs
+        // if !fail, free all frees -> done in tm_end via write nodes
+        // free the data structures in any case
+        seg_idx* curr = transaction->allocations;
+        while(curr){
+            seg_idx* old = curr;
+            curr = curr->next;
+            if(fail) {
+                //free(region->segment_addresses[old->index]);
+                free_seg_index(shared, old->index);
+            }
+            //printf("free 1 %p \n", old);
+            free(old);
+        }
         // Free the read and write set
         if (transaction->reads){
             struct read_node* curr = transaction->reads;
@@ -372,10 +380,10 @@ void tx_clear(shared_t shared, tx_t tx, bool fail){
                 struct write_node* old = curr;
                 curr = curr->next;
                 // free the copy of the write buffer
-                free(old->source);
+                if(old->tbf)free(old->source);
                 free(old);
             }
-            free(curr->source);
+            if(curr->tbf)free(curr->source);
             free(curr);
         }
     }
@@ -512,6 +520,10 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     tx_new->reads = NULL;
     tx_new->writes = NULL;
     tx_new->allocations = NULL;
+    tx_new->buffer_space = 0;
+    tx_new->ctr = 0;
+    tx_new->buffer_w1 = 0;
+    tx_new->buffer_w2 = 0;
     return (tx_t) tx_new;
 }
 
@@ -777,11 +789,24 @@ bool tm_write(shared_t unused(shared), tx_t tx, void const* source, size_t size,
     printf("tm_write\n");
     #endif
     tx_con* transaction = (tx_con*)tx;
+    transaction->buffer_space += size;
     
     //first copy the write buffer
-    void* src_cpy = malloc(size);
+    void* src_cpy;
+    bool tbf = false;
+    if (size == 8 && transaction->ctr == 0){
+        src_cpy = &transaction->buffer_w1;
+        transaction->ctr++;
+    } else if (size == 8 && transaction->ctr == 1){
+        src_cpy = &transaction->buffer_w2;
+        transaction->ctr++;
+    } else {
+        src_cpy = malloc(size);
+        tbf = true;
+    }
     memcpy(src_cpy, source, size);
-    insert_write(&(transaction->writes), src_cpy, size, target);
+    
+    insert_write(&(transaction->writes), src_cpy, size, target, tbf);
     
     // TODO: OPTIONAL first check, if this is a segment allocated in  the current transaction
     return true;
@@ -803,9 +828,8 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
     // Allocate segment
     // 1. get the alignment from the pointer to the region
     size_t align = ((mem_region*) shared)->align;
-    align = align < sizeof(struct segment_node*) ? sizeof(void*) : align;
+    //align = align < sizeof(struct segment_node*) ? sizeof(void*) : align;
 
-    // sn is a pointer to a segment_node
     // we cast that into a pointer to a memory word (void**)
     void* segment;
     if (unlikely(posix_memalign(&segment, align, size) != 0))
@@ -841,7 +865,7 @@ bool tm_free(shared_t unused(shared), tx_t tx, void* target) {
     #endif
     
     tx_con* transaction = (tx_con*)tx;
-    insert_write(&(transaction->writes), NULL, (1ul << 48), target);
+    insert_write(&(transaction->writes), NULL, (1ul << 48), target, false);
 
     return true;
 }

@@ -22,6 +22,8 @@
 
 // Change to print debugging info
 #define DEBUG 0
+#define DEBUG_SE 0
+#define DEBUG_F 0
 #define DEBUG_DET 0
 #define DEBUG_ADDR 0
 #define DEBUG_LOCK 0
@@ -74,7 +76,8 @@ typedef struct write_node* write_list;
 struct read_node {
     struct read_node* prev;
     struct read_node* next;
-    uint16_t segment_idx;
+    void* source;
+    size_t size;
 };
 typedef struct read_node* read_list;
 
@@ -91,7 +94,7 @@ typedef struct transaction_context {
 } tx_con;
 
 // Reads simply get inserted at the start of the list
-void insert_read(read_list* reads_ptr, uint16_t segment_idx){
+void insert_read(read_list* reads_ptr, void* source, size_t size){
     #if DEBUG_DET
     printf("Insert read \n");
     #endif
@@ -99,7 +102,8 @@ void insert_read(read_list* reads_ptr, uint16_t segment_idx){
     struct read_node* n_read = (struct read_node*) malloc(sizeof(struct read_node));
     n_read->next = *reads_ptr;
     n_read->prev = NULL;
-    n_read->segment_idx = segment_idx;
+    n_read->source = source;
+    n_read->size = size;
     *reads_ptr = n_read;
 }
 
@@ -216,8 +220,9 @@ typedef struct region
     struct lock_t segments_lock; 
     uint16_t ctr;
     void* segment_addresses[65536]; // This should correspond to 2^16 entries
-    atomic_uint segment_locks[65536];
-    void* segment_locks_ptr[65536];
+    //atomic_uint segment_locks[65536];
+    size_t segment_sizes[65536];
+    atomic_uint* segment_locks_ptr[65536];
     seg_idx* available_idx;
 } mem_region;
 
@@ -228,10 +233,10 @@ typedef struct region
  * @param ptr Regional virtual address
  * @return A valid virtual address
 */
-void* resolve_addr(shared_t shared, void const* ptr) {
+void* resolve_addr(mem_region* region, void const* ptr) {
     //offset: 0x0FFF && ptr;
     //index: 48 >> ptr
-    void* real_base = ((mem_region *) shared)->segment_addresses[((uintptr_t) ptr >> 48)];
+    void* real_base = region->segment_addresses[((uintptr_t) ptr >> 48)];
     uint64_t vv_base = (((uintptr_t) ptr) >> 48) << 48;
     uint64_t delta = ((uintptr_t) ptr) - vv_base;
     void* res = (void*)(((uintptr_t) real_base) + delta);
@@ -257,6 +262,7 @@ uint16_t get_seg_index(shared_t shared){
         seg_idx* old = region->available_idx;
         region->available_idx = old->next;
         free(region->segment_addresses[old->index]);
+        free(region->segment_locks_ptr[old->index]);
         free(old);
     }
     // TODO: double check, if this is the correct fence
@@ -282,13 +288,14 @@ void free_seg_index(shared_t shared, uint16_t index_old){
     region->available_idx = new_idx;
     // corresponding memory must be freed before this call
     region->segment_addresses[index_old] = NULL;
+    region->segment_locks_ptr[index_old] = NULL; // TODO - urgent!! model check memory management!
     //atomic_thread_fence(memory_order_acquire);
     lock_release(&(region->segments_lock));
 }
 
 // tries to lock write node's segment, if locked
 // returns whether successful
-bool lock_node(mem_region* region, struct write_node* node){
+/*bool lock_node(mem_region* region, struct write_node* node){
     if(!node->locked){
         uint16_t segment_idx = (uint16_t)((uint64_t)node->target >> 48);
         uint v_lock_val = atomic_load(&(region->segment_locks[segment_idx]));
@@ -297,10 +304,44 @@ bool lock_node(mem_region* region, struct write_node* node){
         }
     }
     return node->locked;
+}*/
+
+bool lock_fine_node(mem_region* region, struct write_node* node){
+    if(!node->locked){
+        uint16_t segment_idx = (uint16_t)((uint64_t)node->target >> 48);
+
+        // get lock block address
+        atomic_uint* seg_locks = region->segment_locks_ptr[segment_idx];
+
+        // iterate over all memory chunks
+        bool locked = true;
+        uintptr_t offset = (((uintptr_t)node->target << 16) >> 16 ); // should be 48 1s
+        uint n_first_lock = offset/(region->align);
+        size_t i;
+        for (i = 0; i < (node->size/region->align); i++){
+            uint v_lock_val = atomic_load(&(seg_locks[n_first_lock + i]));
+            if (!(v_lock_val & 1u)){ // not yet locked
+                locked = atomic_compare_exchange_weak(&(seg_locks[n_first_lock+i]), &v_lock_val, v_lock_val+1);
+            } else { // already locked by someone else
+                locked = false;
+            }
+            if (!locked) break;
+        }
+        // if we failed, we must unlock the rest of the node
+        // i is the fist node we were not able to lock
+        if (!locked){
+            for (;i > 0; i--){
+                uint v_lock_val = atomic_load(&(seg_locks[n_first_lock+(i-1)]));
+                atomic_store(&(seg_locks[n_first_lock+(i-1)]), v_lock_val - 1);
+            }
+        }
+        node->locked = locked;
+    }
+    return node->locked;
 }
 
 // unlocks locked nodes corresponding segment lock
-void unlock_all(mem_region* region, tx_con* transaction){
+/*void unlock_all(mem_region* region, tx_con* transaction){
     struct write_node* curr = transaction->writes;
     bool first = true;
     uint16_t segment_idx = 0;
@@ -322,6 +363,33 @@ void unlock_all(mem_region* region, tx_con* transaction){
         curr = curr->next;
         first = false;
     }
+}*/
+
+void unlock_fine_all(mem_region* region, tx_con* transaction){
+    struct write_node* curr = transaction->writes;
+    while (curr){
+        if(curr->locked){
+            uint16_t segment_idx = (uint16_t)((uint64_t)curr->target >> 48);
+
+            // get lock block address
+            atomic_uint* seg_locks = region->segment_locks_ptr[segment_idx];
+
+            // iterate over all memory chunks
+            uintptr_t offset = ((uintptr_t)curr->target << 16) >> 16; // should be 48 1s
+            uint n_first_lock = offset/(region->align);
+            for (size_t i = 0; i < (curr->size/region->align); i++){
+                uint v_lock_val = atomic_load(&(seg_locks[n_first_lock + i]));
+                atomic_store(&(seg_locks[n_first_lock+i]), v_lock_val - 1);
+            }
+
+            #if DEBUG_LOCK
+            printf("Unlocking (fine all) segment %d from %d to version %d \n", segment_idx, v_lock_val, (v_lock_val >> 1));
+            #endif
+
+            curr->locked = false;
+        }
+        curr = curr->next;
+    }
 }
 
 /**
@@ -339,14 +407,31 @@ void byte_wise_atomic_memcpy(void* dest, void* source, size_t count, memory_orde
 }
 
 /**
+ * Allocate locks
+*/
+atomic_uint* alloc_fine_locks(size_t size, size_t align){
+    //return NULL;
+    uint num_locks = (size/align);
+    atomic_uint* fine_locks = (atomic_uint* ) malloc(sizeof(atomic_uint)*num_locks);
+    if (unlikely(!fine_locks))return fine_locks;
+
+    // init all locks to zero
+    for (size_t i = 0; i < num_locks; i++){
+        atomic_store(&(fine_locks[i]), 0);
+    }
+    
+    return fine_locks;
+}
+
+/**
 * Clean up after transaction
 */
 void tx_clear(shared_t shared, tx_t tx, bool fail){
-    #if DEBUG
+    #if DEBUG_F
     if (fail) printf("clearing failed transaction \n");
     #endif
 
-    //mem_region* region = (mem_region *)shared;
+    mem_region* region = (mem_region *)shared;
     tx_con* transaction = (tx_con*)tx;
 
     if (unlikely(!transaction->is_ro)){    
@@ -358,7 +443,8 @@ void tx_clear(shared_t shared, tx_t tx, bool fail){
             seg_idx* old = curr;
             curr = curr->next;
             if(fail) {
-                //free(region->segment_addresses[old->index]);
+                free(region->segment_addresses[old->index]);
+                free(region->segment_locks_ptr[old->index]);
                 free_seg_index(shared, old->index);
             }
             //printf("free 1 %p \n", old);
@@ -412,13 +498,25 @@ shared_t tm_create(size_t size, size_t align) {
         free(region);
         return invalid_shared;
     }
-    atomic_store(&(region->segment_locks[1]), 0);
+    // store size
+    region->segment_sizes[1] = size;
+
+    //atomic_store(&(region->segment_locks[1]), 0); //TBR
+    // allocate lock separately
+    atomic_uint* fine_locks = alloc_fine_locks(size,align);
+    if (unlikely(!fine_locks)){
+        free(region->segment_addresses[1]);
+        free(region);
+        return invalid_shared;
+    }
+    region->segment_locks_ptr[1] = fine_locks;
 
     // Init the global version clock for this shared memory region
     // and the lock for the list of segments
     atomic_store(&(region->gvc),0);
     if (!lock_init(&(region->segments_lock))) {
-        free(region->start);
+        free(region->segment_addresses[1]);
+        free(region->segment_locks_ptr[1]);
         free(region);
         return invalid_shared;
     }
@@ -447,7 +545,7 @@ void tm_destroy(shared_t shared) {
 
     seg_idx* curr = region->available_idx;
     while(curr){
-        region->segment_addresses[curr->index] = NULL;
+        region->segment_addresses[curr->index] = NULL;//redundant?
         seg_idx* old = curr;
         curr = curr->next;
         free(old);
@@ -456,10 +554,12 @@ void tm_destroy(shared_t shared) {
     // free segments
     for (size_t i = 0; i < region->ctr; i++){
         // skip segments that have already been freed
-        if (region->segment_addresses[i]) free(region->segment_addresses[i]);
+        if (region->segment_addresses[i]) {
+            free(region->segment_addresses[i]);
+            free(region->segment_locks_ptr[i]);
+        }
     }
     
-    free(region->segment_addresses[0]); // free the non-free-able 
     //gvc_clean_up(&(region->regional_gvc));
     lock_cleanup(&(region->segments_lock));
     free(region); // free region last
@@ -499,7 +599,7 @@ size_t tm_align(shared_t shared) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared, bool is_ro) {
-    #if DEBUG
+    #if DEBUG_SE
     printf("tm_begin\n");
     #endif
 
@@ -538,7 +638,7 @@ bool tm_end(shared_t shared, tx_t tx) {
     #endif
 
     tx_con* transaction = (tx_con *)tx;
-    if (transaction->is_ro){
+    if (likely(transaction->is_ro)){
         tx_clear(shared, tx, false);
         #if DEBUG
         printf("Read succeeded. \n");
@@ -552,28 +652,20 @@ bool tm_end(shared_t shared, tx_t tx) {
     for (size_t i = 0; i < 300; i++){
         locked = true;
         struct write_node* curr = transaction->writes;
-        bool first = true;
-        uint16_t segment_idx = 0;
         while (curr){
-            uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
-            if (first || segment_idx != segment_idx_curr){
-                segment_idx = segment_idx_curr;
-                locked = locked && lock_node(region, curr);
-                #if DEBUG_LOCK
-                printf("locking %d\n", segment_idx);
-                #endif
-            }
+            locked = locked && lock_fine_node(region, curr);
             curr = curr->next;
-            first = false;
         }
-        // also lock free's TODO
         if (locked) break;
     }
     // If not all locks could be acquired, unlock the locked locks
     if(!locked){
-        unlock_all(region, transaction);
+        unlock_fine_all(region, transaction);
         tx_clear(shared, tx, true);
         #if DEBUG
+        printf("Write failed locking. \n");
+        #endif
+        #if DEBUG_F
         printf("Write failed locking. \n");
         #endif
         return false;
@@ -585,33 +677,29 @@ bool tm_end(shared_t shared, tx_t tx) {
     // TL2 step 5: validate the read set
     if(transaction->rv + 1 != wv){
         struct read_node* curr = transaction->reads;
-        while (curr){
-            uint16_t segment_idx = curr->segment_idx;
-            uint v_lock_val = atomic_load(&(region->segment_locks[segment_idx]));
+        while (curr){ //read nodes are already alignment sized
+            uint16_t segment_idx = (uint16_t)((uint64_t)curr->source >> 48);
+            uintptr_t offset = ((uintptr_t)curr->source  << 16) >> 16;
+            uint n_first_lock = offset/(region->align);
+            uint v_lock_val = atomic_load(&(region->segment_locks_ptr[segment_idx][n_first_lock]));
             bool valid = true;
             if ((v_lock_val >> 1) > transaction->rv) valid = false;
             // if segment is locked, check whether it is our own lock
             else if(v_lock_val & 1u) {
                 valid = false;
                 struct write_node* curr_w   = transaction->writes;
-                bool first_w                = true;
-                uint16_t segment_idx_w      = 0;
-                while (curr_w){
-                    uint16_t segment_idx_curr_w = (uint16_t)((uint64_t)curr_w->target >> 48);
-                    if (first_w || segment_idx_w != segment_idx_curr_w){
-                        segment_idx_w = segment_idx_curr_w;
-                        if (segment_idx_w == segment_idx){
-                            valid = true;
-                            break;
-                        }
+                while (curr_w && curr_w->target <= curr->source){
+                    if ((uintptr_t)curr->source < (uintptr_t)curr_w->target + curr_w->size){
+                        valid = true;
+                        break;
                     }
                     curr_w = curr_w->next;
-                    first_w = false;
                 }
             }
             if (!valid){
                 // post-validation failed
-                unlock_all(region, transaction);
+                // unlock_all(region, transaction);
+                unlock_fine_all(region, transaction);
                 tx_clear(shared, tx, true);
                 #if DEBUG
                 printf("Post validation failed. \n");
@@ -624,41 +712,29 @@ bool tm_end(shared_t shared, tx_t tx) {
 
     // TL2 step 6: commit and release all locks
     struct write_node* curr = transaction->writes;
-    bool first = true;
-    uint16_t segment_idx = 0;
     while (curr){
-        uint16_t segment_idx_curr = (uint16_t)((uint64_t)curr->target >> 48);
+        uint16_t segment_idx = (uint16_t)((uint64_t)curr->target >> 48);
         // write or free
+        bool freed = false;
         if(likely(curr->source)){   // write
-            byte_wise_atomic_memcpy(resolve_addr(shared,curr->target), curr->source, curr->size, memory_order_acquire);
+            byte_wise_atomic_memcpy(resolve_addr(region,curr->target), curr->source, curr->size, memory_order_acquire);
         } else {                    // free
-            //free(resolve_addr(shared, curr->target));
-            free_seg_index(shared, segment_idx_curr);
+            free(region->segment_addresses[segment_idx]);
+            free(region->segment_locks_ptr[segment_idx]);
+            free_seg_index(shared, segment_idx);
+            freed = true;
         }
-        // if this write is the last of the segment, unlock
-        if (!first && segment_idx != segment_idx_curr){
-            // unlock last
-            atomic_store(&(region->segment_locks[segment_idx]), wv<<1);
-            #if DEBUG_LOCK
-            if (segment_idx == 1){
-                printf("Unlocking (after succ 1) segment %d to version %d \n", segment_idx, wv);
-                printf("But value is %d \n", (atomic_load(&region->segment_locks[segment_idx]) >> 1));
+        
+        // iterate over all memory chunks to unlock
+        if(likely(!freed)){ //locks are already gone, if we freed
+            atomic_uint* seg_locks = region->segment_locks_ptr[segment_idx];
+            uintptr_t offset = (((uintptr_t)curr->target << 16) >> 16); // should be 48 1s
+            uint n_first_lock = offset/(region->align);
+            for (size_t i = 0; i < (curr->size/region->align); i++){
+                atomic_store(&(seg_locks[n_first_lock + i]), wv<<1);
             }
-            #endif
         }
-        if (!curr->next){
-            // unlock current
-            atomic_store(&(region->segment_locks[segment_idx_curr]), wv<<1);
-            #if DEBUG_LOCK
-            if (segment_idx_curr == 1){
-                printf("Unlocking (after succ 2) segment %d to version %d \n", segment_idx_curr, wv);
-                printf("But value is %d \n", (atomic_load(&region->segment_locks[segment_idx]) >> 1));
-            }
-            #endif
-        }
-        segment_idx = segment_idx_curr;
         curr = curr->next;
-        first = false;
     }
 
     // TODO: allocate and free segments correctly
@@ -669,35 +745,21 @@ bool tm_end(shared_t shared, tx_t tx) {
     return true;
 }
 
-/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param source Source start address (in the shared region)
- * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
- * @param target Target start address (in a private region)
- * @return Whether the whole transaction can continue
-**/
-bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {        
-    #if DEBUG
-    printf("tm_read\n");
-    #endif
-    // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-    mem_region* region = (mem_region *)shared;
-    tx_con* transaction = (tx_con *)tx;
+bool chunk_read(mem_region* region, tx_con* transaction, void* source, size_t size, void* target, uint lock_idx){
+    
     uint16_t segment_idx = (uint16_t)((uintptr_t) source >> 48);
-    //printf("read segment: %d from ptr %p to buffer %p \n", segment_idx, source, target);
     uint v_lock_val;
-    //printf("read: %p , resolved: %p \n", source, resolve_addr(shared, source));
+    //printf("read: %p , resolved: %p \n", source, resolve_addr(region, source));
     if (likely(transaction->is_ro)){
         // read directly
         byte_wise_atomic_memcpy(target,
-            resolve_addr(shared, source), 
-            size, memory_order_acquire);
-        v_lock_val = atomic_load(&region->segment_locks[segment_idx]);
+            resolve_addr(region, source), 
+            size, memory_order_acquire); 
+        v_lock_val = atomic_load(&(region->segment_locks_ptr[segment_idx][lock_idx]));
     } else {
-        insert_read(&(transaction->reads),segment_idx);
+        insert_read(&(transaction->reads), source, size);
 
-        uint old_lock_v = atomic_load(&region->segment_locks[segment_idx]); // prior lock load
+        uint old_lock_v = atomic_load(&(region->segment_locks_ptr[segment_idx][lock_idx])); // prior lock load
 
         // check if read overlaps with write set
         // perform the corresponding read operations
@@ -720,7 +782,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
                 if ( start_adr < ovr_start_adr){
                     size_t delta = ovr_start_adr - start_adr; // TODO:double check
                     byte_wise_atomic_memcpy((void *)private_start_adr,
-                        resolve_addr(shared, (void *)start_adr), 
+                        resolve_addr(region, (void *)start_adr), 
                         delta, memory_order_acquire);
                     start_adr += delta;
                     private_start_adr += delta;
@@ -742,7 +804,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
             } else {
                 // read directly
                 byte_wise_atomic_memcpy(target,
-                    resolve_addr(shared, source), 
+                    resolve_addr(region, source), 
                     size, memory_order_acquire);
                 #if DEBUG
                 //if (!(transaction->is_ro)) printf("Done\n");
@@ -751,9 +813,8 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
             }
         }
         
-        v_lock_val = atomic_load(&(region->segment_locks[segment_idx])); // posterior lock load
+        v_lock_val = atomic_load(&(region->segment_locks_ptr[segment_idx][lock_idx])); // posterior lock load
         if(old_lock_v != v_lock_val){
-            tx_clear(shared, tx, true);
             return false;
         }
     }
@@ -765,15 +826,45 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         #if DEBUG_LOCK
         printf("lock bit %d in segment %d \n", (v_lock_val & 1u), segment_idx);
         printf("lock version number %d rv %d \n", (v_lock_val >> 1), transaction->rv);
-        printf("Current lock value is %d \n", (atomic_load(&region->segment_locks[segment_idx]) >> 1));
+        printf("Current lock value is %d \n", (atomic_load(&(region->segment_locks_ptr[segment_idx][lock_idx])) >> 1));
         #endif
 
-        tx_clear(shared, tx, true);
         return false;
     }
     return true;
 
-    // TODO: add optimization for rw by checking if is a segment allocated in the current transaction
+}
+
+/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to use
+ * @param source Source start address (in the shared region)
+ * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
+ * @param target Target start address (in a private region)
+ * @return Whether the whole transaction can continue
+**/
+bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {        
+    #if DEBUG
+    printf("tm_read\n");
+    #endif
+
+    mem_region* region = (mem_region *)shared;
+    tx_con* transaction = (tx_con *)tx;
+
+    uintptr_t offset = (uintptr_t)(((uintptr_t)source << 16) >> 16);
+    uint n_first_lock = offset/(region->align);
+    uintptr_t src = (uintptr_t)source;
+    uintptr_t trg = (uintptr_t)target;
+    //printf("offset: %u lock0: %u src: %u target: %u \n", offset, n_first_lock, src, trg);
+    for( size_t c_n = 0; c_n<(size/region->align); c_n++ ){
+        if(!chunk_read(region, transaction, (void*)src, region->align, (void*)trg, n_first_lock + c_n)){
+            tx_clear(shared, tx, true);
+            return false;
+        }
+        src += region->align;
+        target += region->align;
+    }
+    return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -834,12 +925,24 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
     void* segment;
     if (unlikely(posix_memalign(&segment, align, size) != 0))
         return nomem_alloc; // Failed allocation!
+    
+    // allocate lock separately
+    atomic_uint* fine_locks = alloc_fine_locks(size, align);
+    if (unlikely(!fine_locks)){
+        free(segment);
+        return nomem_alloc;
+    }
 
     // store our address in the huge array of all addresses
     uint16_t segment_idx = get_seg_index(shared);
-    ((struct region*)shared)->segment_addresses[segment_idx] = segment;
-    // initialize the lock
-    atomic_store(&(region->segment_locks[segment_idx]), 0);
+    # if DEBUG
+    printf("allocate seg %d \n", segment_idx);
+    # endif
+    region->segment_addresses[segment_idx] = segment;
+    region->segment_locks_ptr[segment_idx] = fine_locks;
+    // store size
+    region->segment_sizes[segment_idx] = size;
+    
     // list this, since it's not commited yet
     tx_con* transaction = (tx_con*)tx;
     append_idx(&(transaction->allocations), segment_idx);
@@ -859,13 +962,16 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t unused(shared), tx_t tx, void* target) {
+bool tm_free(shared_t shared, tx_t tx, void* target) {
     #if DEBUG
     printf("tm_free \n");
     #endif
     
+    mem_region* region = (mem_region*) shared;
     tx_con* transaction = (tx_con*)tx;
-    insert_write(&(transaction->writes), NULL, (1ul << 48), target, false);
+    uint16_t idx = (uint16_t)((uint64_t)target >> 48);
+
+    insert_write(&(transaction->writes), NULL, region->segment_sizes[idx], target, false);
 
     return true;
 }

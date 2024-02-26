@@ -1,4 +1,10 @@
-# CS-453 - Course project
+# Software Transactional Memory - TL2 implementation
+
+This is my personal submission to the CS-453 course on concurrent algorithms at EPFL.
+It contains a C implementation of the Transactional Locking II algorithm, yielding a 4.42937x speedup over the baseline approach, thus achieving the maximum grade.
+The original assignment follows hereafter:
+
+## CS-453 - Course project
 
 The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) is available on [Moodle](https://moodle.epfl.ch/course/view.php?id=14334) and the [website of the course](https://dcl.epfl.ch/site/education/ca_2021).
 
